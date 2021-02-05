@@ -226,6 +226,16 @@ DOMAIN_SEPARATOR: public(bytes32)
 DOMAIN_TYPE_HASH: constant(bytes32) = keccak256('EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)')
 PERMIT_TYPE_HASH: constant(bytes32) = keccak256("Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)")
 
+struct PriceSnapshot:
+    blockNumber: uint256
+    blockTimestamp: uint256
+    pricePerShare: uint256
+
+# len(sriceSnapshot)
+nextPriceSnapshotID: uint256
+# snapshotID => Snapshot
+priceSnapshots: HashMap[uint256, PriceSnapshot]
+
 
 @external
 def initialize(
@@ -985,6 +995,16 @@ def withdraw(
 
 
 @view
+@internal
+def _pricePerShare() -> uint256:
+    # NOTE: See `pricePerShare()`
+    if self.totalSupply == 0:
+        return 10 ** self.decimals  # price of 1:1
+    else:
+        return self._shareValue(10 ** self.decimals)
+
+
+@view
 @external
 def pricePerShare() -> uint256:
     """
@@ -992,10 +1012,7 @@ def pricePerShare() -> uint256:
     @dev See dev note on `withdraw`.
     @return The value of a single share.
     """
-    if self.totalSupply == 0:
-        return 10 ** self.decimals  # price of 1:1
-    else:
-        return self._shareValue(10 ** self.decimals)
+    return self._pricePerShare()
 
 
 @internal
@@ -1537,6 +1554,15 @@ def report(gain: uint256, loss: uint256, _debtPayment: uint256) -> uint256:
     self.strategies[msg.sender].lastReport = block.timestamp
     self.lastReport = block.timestamp
 
+    # Snapshot the price at this report
+    eventId: uint256 = self.nextPriceSnapshotID
+    self.priceSnapshots[eventId] = PriceSnapshot({
+        blockNumber: block.number,
+        blockTimestamp: block.timestamp,
+        pricePerShare: self._pricePerShare(),
+    })
+    self.nextPriceSnapshotID = eventId + 1
+
     log StrategyReported(
         msg.sender,
         gain,
@@ -1556,6 +1582,85 @@ def report(gain: uint256, loss: uint256, _debtPayment: uint256) -> uint256:
     else:
         # Otherwise, just return what we have as debt outstanding
         return debt
+
+
+@view
+@external
+def pricePerShareAtTimestamp(targetTimestamp: uint256) -> uint256:
+    if targetTimestamp < self.activation:
+        return 0  # Before recorded events are possible
+
+    maxEventId: uint256 = self.nextPriceSnapshotID
+    if maxEventId == 0:
+        return 0  # No events yet
+
+    maxEventId -= 1  # At least one event has happened
+    if self.priceSnapshots[maxEventId].blockTimestamp <= targetTimestamp:
+        return self._pricePerShare()  # After the last event, so return current
+
+    minEventId: uint256 = 0
+    if self.priceSnapshots[minEventId].blockTimestamp > targetTimestamp:
+        return 0  # Before the first event
+
+    # Binary search for block.number (maxiumum `log_2(MAX_UINT256)` iterations)
+    for lvl in range(256):
+
+        if minEventId >= maxEventId:
+            break
+
+        # NOTE: This is the `ceil` variant of this algorithm, so add 1 here
+        selectedEventId: uint256 = (minEventId + maxEventId + 1) / 2
+
+        if self.priceSnapshots[selectedEventId].blockTimestamp > targetTimestamp:
+            # Move search range downwards
+            # NOTE: This is the `ceil` variant of this algorithm, so only deduct 1 here
+            maxEventId = selectedEventId - 1
+
+        else:
+            # Move search range upwards
+            # NOTE: Always move up so we snag the last event in a series where a
+            #       bunch of transfer events occured within the same block (e.g. flashmint)
+            minEventId = selectedEventId
+
+    return self.priceSnapshots[maxEventId].pricePerShare
+
+
+@view
+@external
+def pricePerShareAtBlockNumber(targetBlockNumber: uint256) -> uint256:
+    maxEventId: uint256 = self.nextPriceSnapshotID
+    if maxEventId == 0:
+        return 0  # No events yet
+
+    maxEventId -= 1  # At least one event has happened
+    if self.priceSnapshots[maxEventId].blockNumber <= targetBlockNumber:
+        return self._pricePerShare()  # After the last event, so return current
+
+    minEventId: uint256 = 0
+    if self.priceSnapshots[minEventId].blockNumber > targetBlockNumber:
+        return 0  # Before the first event
+
+    # Binary search for block.number (maxiumum `log_2(MAX_UINT256)` iterations)
+    for lvl in range(256):
+
+        if minEventId >= maxEventId:
+            break
+
+        # NOTE: This is the `ceil` variant of this algorithm, so add 1 here
+        selectedEventId: uint256 = (minEventId + maxEventId + 1) / 2
+
+        if self.priceSnapshots[selectedEventId].blockNumber > targetBlockNumber:
+            # Move search range downwards
+            # NOTE: This is the `ceil` variant of this algorithm, so only deduct 1 here
+            maxEventId = selectedEventId - 1
+
+        else:
+            # Move search range upwards
+            # NOTE: Always move up so we snag the last event in a series where a
+            #       bunch of transfer events occured within the same block (e.g. flashmint)
+            minEventId = selectedEventId
+
+    return self.priceSnapshots[maxEventId].pricePerShare
 
 
 @internal
